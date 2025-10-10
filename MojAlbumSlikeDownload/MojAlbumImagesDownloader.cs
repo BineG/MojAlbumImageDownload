@@ -34,8 +34,21 @@ namespace MojAlbumSlikeDownload
 
         public async Task DownloadAllImages(CancellationToken cancellationToken = default)
         {
-            var startUri = await LoginAsync(cancellationToken).ConfigureAwait(false);
-            await CrawlAlbumsAndDownloadImagesAsync(startUri, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                var startUri = await LoginAsync(cancellationToken).ConfigureAwait(false);
+                await CrawlAlbumsAndDownloadImagesAsync(startUri, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                Console.Error.WriteLine("Operation was canceled by the user.");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                LogError("Failed to download all images.", ex);
+                throw;
+            }
         }
 
         private async Task<Uri> LoginAsync(CancellationToken cancellationToken)
@@ -88,8 +101,17 @@ namespace MojAlbumSlikeDownload
                 : _downloadSettings.OutputDirectory!;
             Directory.CreateDirectory(outputRoot);
 
-            // Load the page we were redirected to after login and start parsing from there
-            var startHtml = await GetStringAsync(startUri, cancellationToken);
+            string startHtml;
+            try
+            {
+                // Load the page we were redirected to after login and start parsing from there
+                startHtml = await GetStringAsync(startUri, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                LogError($"Failed to load start page: {startUri}", ex);
+                throw;
+            }
 
             // Parse albums and follow each CollectionLink hyperlink (text is album name)
             var albumRefs = ParseAlbumLinks(startHtml, _client.BaseAddress!);
@@ -98,8 +120,27 @@ namespace MojAlbumSlikeDownload
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var albumHtml = await GetStringAsync(album.Url, cancellationToken);
-                var imageLinks = ParseImageLinks(albumHtml, _client.BaseAddress!);
+                string albumHtml;
+                try
+                {
+                    albumHtml = await GetStringAsync(album.Url, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    LogError($"Failed to load album page '{album.Name}' ({album.Url}). Skipping album.", ex);
+                    continue;
+                }
+
+                IEnumerable<Uri> imageLinks;
+                try
+                {
+                    imageLinks = ParseImageLinks(albumHtml, _client.BaseAddress!);
+                }
+                catch (Exception ex)
+                {
+                    LogError($"Failed to parse image links for album '{album.Name}'. Skipping album.", ex);
+                    continue;
+                }
 
                 // Create subfolder per album name
                 var albumFolderName = SanitizeFolderName(album.Name);
@@ -110,8 +151,16 @@ namespace MojAlbumSlikeDownload
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
-                    // Image page contains the large image behind itemprop="contentUrl" link target
-                    await DownloadImagePageAsync(imageLink, albumFolderPath, cancellationToken);
+                    try
+                    {
+                        // Image page contains the large image behind itemprop="contentUrl" link target
+                        await DownloadImagePageAsync(imageLink, albumFolderPath, cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogError($"Failed to download image from page {imageLink}. Skipping image.", ex);
+                        // continue with next image
+                    }
                 }
             }
         }
@@ -240,6 +289,21 @@ namespace MojAlbumSlikeDownload
             }
             var cleaned = sb.ToString().Trim();
             return string.IsNullOrWhiteSpace(cleaned) ? "Album" : cleaned;
+        }
+
+        private static void LogError(string message, Exception ex)
+        {
+            var originalColor = Console.ForegroundColor;
+            try
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.Error.WriteLine($"{DateTime.UtcNow:u} ERROR: {message}");
+                Console.Error.WriteLine($"{ex.GetType().Name}: {ex.Message}");
+            }
+            finally
+            {
+                Console.ForegroundColor = originalColor;
+            }
         }
     }
 }
