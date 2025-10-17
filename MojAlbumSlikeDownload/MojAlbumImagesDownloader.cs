@@ -185,6 +185,7 @@ namespace MojAlbumSlikeDownload
                     {
                         var href = a.GetAttributeValue("href", null);
                         if (string.IsNullOrWhiteSpace(href)) continue;
+
                         var nameText = HtmlEntity.DeEntitize(a.InnerText).Trim();
                         if (string.IsNullOrWhiteSpace(nameText))
                         {
@@ -215,6 +216,13 @@ namespace MojAlbumSlikeDownload
                 {
                     var href = a.GetAttributeValue("href", null);
                     if (string.IsNullOrWhiteSpace(href)) continue;
+
+                    // append "/povecaj" to the href, ensuring exactly one slash
+                    if (!href.TrimEnd('/').EndsWith("povecaj", StringComparison.OrdinalIgnoreCase))
+                    {
+                        href = href.EndsWith("/") ? href + "povecaj" : href + "/povecaj";
+                    }
+
                     links.Add(new Uri(baseUri, href));
                 }
             }
