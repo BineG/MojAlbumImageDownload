@@ -37,7 +37,9 @@ namespace MojAlbumSlikeDownload
             try
             {
                 var startUri = await LoginAsync(cancellationToken).ConfigureAwait(false);
-                await CrawlAlbumsAndDownloadImagesAsync(startUri, cancellationToken).ConfigureAwait(false);
+                // After login, go to the page with "/albumi" appended to the current URL
+                var albumsUri = AppendPathSegment(startUri, "albumi");
+                await CrawlAlbumsAndDownloadImagesAsync(albumsUri, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -101,67 +103,92 @@ namespace MojAlbumSlikeDownload
                 : _downloadSettings.OutputDirectory!;
             Directory.CreateDirectory(outputRoot);
 
-            string startHtml;
-            try
-            {
-                // Load the page we were redirected to after login and start parsing from there
-                startHtml = await GetStringAsync(startUri, cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                LogError($"Failed to load start page: {startUri}", ex);
-                throw;
-            }
+            var currentUri = startUri;
 
-            // Parse albums and follow each CollectionLink hyperlink (text is album name)
-            var albumRefs = ParseAlbumLinks(startHtml, _client.BaseAddress!);
-
-            foreach (var album in albumRefs)
+            while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                string albumHtml;
+                string pageHtml;
                 try
                 {
-                    albumHtml = await GetStringAsync(album.Url, cancellationToken);
+                    // Load the current album list page
+                    pageHtml = await GetStringAsync(currentUri, cancellationToken);
                 }
                 catch (Exception ex)
                 {
-                    LogError($"Failed to load album page '{album.Name}' ({album.Url}). Skipping album.", ex);
-                    continue;
+                    LogError($"Failed to load page: {currentUri}", ex);
+                    throw;
                 }
 
-                IEnumerable<Uri> imageLinks;
-                try
-                {
-                    imageLinks = ParseImageLinks(albumHtml, _client.BaseAddress!);
-                }
-                catch (Exception ex)
-                {
-                    LogError($"Failed to parse image links for album '{album.Name}'. Skipping album.", ex);
-                    continue;
-                }
+                // Parse albums and follow each CollectionLink hyperlink (text is album name)
+                var albumRefs = ParseAlbumLinks(pageHtml, currentUri);
 
-                // Create subfolder per album name
-                var albumFolderName = SanitizeFolderName(album.Name);
-                var albumFolderPath = Path.Combine(outputRoot, albumFolderName);
-                Directory.CreateDirectory(albumFolderPath);
-
-                foreach (var imageLink in imageLinks)
+                foreach (var album in albumRefs)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
+                    string albumHtml;
                     try
                     {
-                        // Image page contains the large image behind itemprop="contentUrl" link target
-                        await DownloadImagePageAsync(imageLink, albumFolderPath, cancellationToken);
+                        albumHtml = await GetStringAsync(album.Url, cancellationToken);
                     }
                     catch (Exception ex)
                     {
-                        LogError($"Failed to download image from page {imageLink}. Skipping image.", ex);
-                        // continue with next image
+                        LogError($"Failed to load album page '{album.Name}' ({album.Url}). Skipping album.", ex);
+                        continue;
+                    }
+
+                    IEnumerable<Uri> imageLinks;
+                    try
+                    {
+                        imageLinks = ParseImageLinks(albumHtml, _client.BaseAddress!);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogError($"Failed to parse image links for album '{album.Name}'. Skipping album.", ex);
+                        continue;
+                    }
+
+                    // Create subfolder per album name
+                    var albumFolderName = SanitizeFolderName(album.Name);
+                    var albumFolderPath = Path.Combine(outputRoot, albumFolderName);
+                    Directory.CreateDirectory(albumFolderPath);
+
+                    foreach (var imageLink in imageLinks)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        try
+                        {
+                            // Image page contains the large image behind itemprop="contentUrl" link target
+                            await DownloadImagePageAsync(imageLink, albumFolderPath, cancellationToken);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogError($"Failed to download image from page {imageLink}. Skipping image.", ex);
+                            // continue with next image
+                        }
                     }
                 }
+
+                // Pager: find the current link and then the next hyperlink sibling
+                var nextPageUri = TryGetNextPageUri(pageHtml, currentUri);
+                if (nextPageUri == null)
+                {
+                    // No next page -> stop
+                    break;
+                }
+
+                // Resolve the effective URL after any redirect (e.g., /albumi/2 -> /albumi)
+                var effectiveNextUri = await ResolveEffectiveUriAsync(nextPageUri, cancellationToken).ConfigureAwait(false);
+                if (effectiveNextUri == currentUri)
+                {
+                    // Resolved to the same page -> stop
+                    break;
+                }
+
+                currentUri = effectiveNextUri;
             }
         }
 
@@ -171,34 +198,29 @@ namespace MojAlbumSlikeDownload
             doc.LoadHtml(html);
 
             var results = new List<AlbumRef>();
-            // Container with AlbumsBrowser and AlbumsBrowserNarrow classes
-            var containers = doc.DocumentNode.SelectNodes("//div[contains(concat(' ', normalize-space(@class), ' '), ' AlbumsBrowser ') and contains(concat(' ', normalize-space(@class), ' '), ' AlbumsBrowserNarrow ')]");
-            if (containers != null)
+
+            // Directly find anchors inside CollectionLink containers across the page
+            var anchors = doc.DocumentNode.SelectNodes("//div[contains(concat(' ', normalize-space(@class), ' '), ' CollectionLink ')]/a[@href]");
+            if (anchors != null)
             {
-                foreach (var container in containers)
+                foreach (var a in anchors)
                 {
-                    // Prefer the link that contains the album name text: div.CollectionLink a[href]
-                    var anchors = container.SelectNodes(".//div[contains(concat(' ', normalize-space(@class), ' '), ' CollectionLink ')]//a[@href]");
-                    if (anchors == null) continue;
+                    var href = a.GetAttributeValue("href", null);
+                    if (string.IsNullOrWhiteSpace(href)) continue;
 
-                    foreach (var a in anchors)
+                    var nameText = HtmlEntity.DeEntitize(a.InnerText).Trim();
+                    if (string.IsNullOrWhiteSpace(nameText))
                     {
-                        var href = a.GetAttributeValue("href", null);
-                        if (string.IsNullOrWhiteSpace(href)) continue;
-
-                        var nameText = HtmlEntity.DeEntitize(a.InnerText).Trim();
-                        if (string.IsNullOrWhiteSpace(nameText))
-                        {
-                            // fallback to title attribute or alt
-                            nameText = a.GetAttributeValue("title", string.Empty);
-                        }
-                        if (string.IsNullOrWhiteSpace(nameText)) continue;
-
-                        var url = new Uri(baseUri, href);
-                        results.Add(new AlbumRef(url, nameText));
+                        // fallback to title attribute or alt
+                        nameText = a.GetAttributeValue("title", string.Empty);
                     }
+                    if (string.IsNullOrWhiteSpace(nameText)) continue;
+
+                    var url = new Uri(baseUri, href);
+                    results.Add(new AlbumRef(url, nameText));
                 }
             }
+
             return results;
         }
 
@@ -217,13 +239,14 @@ namespace MojAlbumSlikeDownload
                     var href = a.GetAttributeValue("href", null);
                     if (string.IsNullOrWhiteSpace(href)) continue;
 
-                    // append "/povecaj" to the href, ensuring exactly one slash
-                    if (!href.TrimEnd('/').EndsWith("povecaj", StringComparison.OrdinalIgnoreCase))
-                    {
-                        href = href.EndsWith("/") ? href + "povecaj" : href + "/povecaj";
-                    }
+                    // Build initial absolute/relative URI, then append "povecaj" using the helper if needed
+                    var initialUri = new Uri(baseUri, href);
+                    var path = initialUri.AbsolutePath.TrimEnd('/');
+                    var finalUri = path.EndsWith("povecaj", StringComparison.OrdinalIgnoreCase)
+                        ? initialUri
+                        : AppendPathSegment(initialUri, "povecaj");
 
-                    links.Add(new Uri(baseUri, href));
+                    links.Add(finalUri);
                 }
             }
             return links;
@@ -266,6 +289,15 @@ namespace MojAlbumSlikeDownload
             response.EnsureSuccessStatusCode();
             // Cookies (e.g., PHPSESSID, login) are captured by the HttpClientHandler's CookieContainer and will be sent automatically on subsequent requests.
             return await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        // Resolve the final effective URL after any server redirects
+        private async Task<Uri> ResolveEffectiveUriAsync(Uri url, CancellationToken cancellationToken)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            using var response = await _client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            return response.RequestMessage?.RequestUri ?? url;
         }
 
         private async Task DownloadAndSaveAsync(Uri url, string albumFolderPath, CancellationToken cancellationToken)
@@ -312,6 +344,42 @@ namespace MojAlbumSlikeDownload
             {
                 Console.ForegroundColor = originalColor;
             }
+        }
+
+        private static Uri AppendPathSegment(Uri uri, string segment)
+        {
+            if (uri == null) throw new ArgumentNullException(nameof(uri));
+            if (string.IsNullOrWhiteSpace(segment)) return uri;
+
+            // Ensure we treat the base as a directory to append a child segment
+            var baseText = uri.ToString();
+            if (!baseText.EndsWith("/"))
+            {
+                baseText += "/";
+            }
+            return new Uri(new Uri(baseText), segment.Trim('/'));
+        }
+
+        private static Uri? TryGetNextPageUri(string html, Uri currentUri)
+        {
+            var doc = new HtmlDocument();
+            doc.LoadHtml(html);
+
+            // Find the pager container
+            var pager = doc.DocumentNode.SelectSingleNode("//div[contains(concat(' ', normalize-space(@class), ' '), ' Pager ')]");
+            if (pager == null) return null;
+
+            // Find the current page link and then the next sibling link
+            var current = pager.SelectSingleNode(".//a[contains(concat(' ', normalize-space(@class), ' '), ' PagerCurrent ')]");
+            if (current == null) return null;
+
+            var next = current.SelectSingleNode("following-sibling::a[1][@href]");
+            if (next == null) return null;
+
+            var href = next.GetAttributeValue("href", null);
+            if (string.IsNullOrWhiteSpace(href)) return null;
+
+            return new Uri(currentUri, href);
         }
     }
 }
