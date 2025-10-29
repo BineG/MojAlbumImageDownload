@@ -98,9 +98,15 @@ namespace MojAlbumSlikeDownload
         private async Task CrawlAlbumsAndDownloadImagesAsync(Uri startUri, CancellationToken cancellationToken)
         {
             // Ensure root download folder exists
-            var outputRoot = string.IsNullOrWhiteSpace(_downloadSettings.OutputDirectory)
+            var baseOutputRoot = string.IsNullOrWhiteSpace(_downloadSettings.OutputDirectory)
                 ? Path.Combine(Environment.CurrentDirectory, "downloads")
                 : _downloadSettings.OutputDirectory!;
+
+            // Append the input username as a subfolder under the base output path
+            var rawUsername = _mojAlbumOptions.Authentication?.Username ?? string.Empty;
+            var usernameFolder = SanitizeFolderName(rawUsername);
+            if (string.IsNullOrWhiteSpace(usernameFolder)) usernameFolder = "user";
+            var outputRoot = Path.Combine(baseOutputRoot, usernameFolder);
             Directory.CreateDirectory(outputRoot);
 
             var currentUri = startUri;
@@ -128,47 +134,69 @@ namespace MojAlbumSlikeDownload
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
-                    string albumHtml;
-                    try
-                    {
-                        albumHtml = await GetStringAsync(album.Url, cancellationToken);
-                    }
-                    catch (Exception ex)
-                    {
-                        LogError($"Failed to load album page '{album.Name}' ({album.Url}). Skipping album.", ex);
-                        continue;
-                    }
-
-                    IEnumerable<Uri> imageLinks;
-                    try
-                    {
-                        imageLinks = ParseImageLinks(albumHtml, _client.BaseAddress!);
-                    }
-                    catch (Exception ex)
-                    {
-                        LogError($"Failed to parse image links for album '{album.Name}'. Skipping album.", ex);
-                        continue;
-                    }
-
-                    // Create subfolder per album name
+                    // Create subfolder per album name once
                     var albumFolderName = SanitizeFolderName(album.Name);
                     var albumFolderPath = Path.Combine(outputRoot, albumFolderName);
                     Directory.CreateDirectory(albumFolderPath);
 
-                    foreach (var imageLink in imageLinks)
+                    // Each album can have its own paging of pictures; iterate through all pages
+                    var albumPageUri = album.Url;
+                    while (true)
                     {
-                        cancellationToken.ThrowIfCancellationRequested();
-
+                        string albumHtml;
                         try
                         {
-                            // Image page contains the large image behind itemprop="contentUrl" link target
-                            await DownloadImagePageAsync(imageLink, albumFolderPath, cancellationToken);
+                            albumHtml = await GetStringAsync(albumPageUri, cancellationToken);
                         }
                         catch (Exception ex)
                         {
-                            LogError($"Failed to download image from page {imageLink}. Skipping image.", ex);
-                            // continue with next image
+                            LogError($"Failed to load album page '{album.Name}' ({albumPageUri}). Skipping album.", ex);
+                            break; // skip to next album
                         }
+
+                        IEnumerable<Uri> imageLinks;
+                        try
+                        {
+                            // Resolve image links relative to the current album page URL
+                            imageLinks = ParseImageLinks(albumHtml, albumPageUri);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogError($"Failed to parse image links for album '{album.Name}'. Skipping album page.", ex);
+                            imageLinks = Array.Empty<Uri>();
+                        }
+
+                        foreach (var imageLink in imageLinks)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+
+                            try
+                            {
+                                // Image page contains the large image behind itemprop="contentUrl" link target
+                                await DownloadImagePageAsync(imageLink, albumFolderPath, cancellationToken);
+                            }
+                            catch (Exception ex)
+                            {
+                                LogError($"Failed to download image from page {imageLink}. Skipping image.", ex);
+                                // continue with next image
+                            }
+                        }
+
+                        // Move to next page within the album if available
+                        var nextAlbumPageUri = TryGetNextPageUri(albumHtml, albumPageUri);
+                        if (nextAlbumPageUri == null)
+                        {
+                            break; // no more pages in album
+                        }
+
+                        // Resolve redirects to avoid loops (/album/2 -> /album)
+                        var effectiveAlbumNext = await ResolveEffectiveUriAsync(nextAlbumPageUri, cancellationToken).ConfigureAwait(false);
+                        if (effectiveAlbumNext == albumPageUri)
+                        {
+                            break; // resolved to same URL -> stop album paging
+                        }
+
+                        albumPageUri = effectiveAlbumNext;
                     }
                 }
 
